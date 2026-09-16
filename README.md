@@ -132,10 +132,11 @@ python QuickWipeV2.0.py --simulate --disk 0       # 走完整流程，但不写�
 
 ## 相关阅读
 
-这个工具的来由、以及硬盘擦除的一些实践记录，写在作者的博客上：
+这个工具的设计思路、以及硬盘擦除的实践记录，写在作者的博客上：
 
-- [XiaoZou123 技术博客 · 系统与硬件方向](https://xiaozou123.cn/digital-disassembly/)
+- **[硬盘安全擦除：为什么全盘填充是浪费时间](https://xiaozou123.cn/secure-disk-erase-why-full-disk-fill-wastes-time/)** —— 本工具的配套文章，讲清该填多少、为什么
 - [SSD 知识：企业级与消费级的区别？](https://xiaozou123.cn/ssd-knowledge-what-is-the-difference-between-enterprise-level-and-consumer-level/)
+- [XiaoZou123 技术博客 · 系统与硬件方向](https://xiaozou123.cn/digital-disassembly/)
 
 ## 免责声明
 
