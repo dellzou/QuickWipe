@@ -21,6 +21,29 @@ import math
 import shutil
 
 
+def _fix_pywin32_genpath():
+    """把 pywin32 的 COM 类型库缓存重定向到用户可写目录。
+
+    默认位置是 C:\\Windows\\gen_py，普通权限下会抛
+    PermissionError: [WinError 5] 拒绝访问。
+    必须在首次 import win32com.client 之前执行。
+    """
+    try:
+        import win32com
+        gen_path = os.path.join(tempfile.gettempdir(), "gen_py")
+        os.makedirs(gen_path, exist_ok=True)
+        win32com.__gen_path__ = gen_path
+    except Exception:
+        pass  # 非 Windows / 未装 pywin32 时静默跳过
+
+
+_fix_pywin32_genpath()
+
+# 演练模式：只读磁盘信息 + 模拟进度输出，不打开物理设备、不写入任何数据。
+# 通过 --simulate 参数或环境变量 QUICKWIPE_SIMULATE=1 启用。
+SIMULATE = os.environ.get("QUICKWIPE_SIMULATE") == "1"
+
+
 class DiskWiper:
     def __init__(self):
         self.system = platform.system()
@@ -98,11 +121,81 @@ class DiskWiper:
             print(f"获取硬盘信息失败: {e}")
             return "UNKNOWN", "UNKNOWN"
 
+    # ------------------------------------------------------------------
+    # MSFT_PhysicalDisk 的枚举值。
+    #
+    # 为什么不用 Win32_DiskDrive.InterfaceType：
+    #   它返回的是「驱动栈形态」而非物理接口 ——
+    #   NVMe 设备会被报成 "SCSI"，SATA 设备会被报成 "IDE"。
+    #   实测：KBG5AZNV512G / ZHITAI Ti600 两块 NVMe 都返回 "SCSI"，
+    #   ST4000DM004 这块 SATA 盘返回 "IDE"，于是
+    #   "nvme" in interface 与 "ata" in interface 双双落空 → UNKNOWN。
+    #
+    # 为什么要用 MSFT_PhysicalDisk：
+    #   它返回确定的枚举值，不依赖型号字符串 ——
+    #   现代型号名（kbg5aznv512g、zhitai ti600、st4000dm004）里
+    #   基本不含 ssd / hdd / nvme 任何关键词。
+    # ------------------------------------------------------------------
+    BUS_TYPE = {
+        0: "UNKNOWN", 1: "SCSI", 2: "ATAPI", 3: "ATA", 4: "1394",
+        5: "SSA", 6: "FibreChannel", 7: "USB", 8: "RAID", 9: "iSCSI",
+        10: "SAS", 11: "SATA", 12: "SD", 13: "MMC", 14: "Virtual",
+        15: "FileBackedVirtual", 16: "StorageSpaces", 17: "NVMe",
+    }
+    MEDIA_TYPE = {0: "UNKNOWN", 3: "HDD", 4: "SSD", 5: "SCM"}
+
+    def _query_physical_disks(self) -> Dict[int, Tuple[str, str]]:
+        """返回 {磁盘编号: (介质类型, 物理接口)}。
+
+        数据源是 MSFT_PhysicalDisk（root\\Microsoft\\Windows\\Storage），
+        其 DeviceId 与 Win32_DiskDrive.Index 一一对应。
+        查询失败（旧系统 / 无权限）时返回空字典，调用方自动回退。
+        """
+        try:
+            import wmi
+            c = wmi.WMI(namespace=r"root\Microsoft\Windows\Storage")
+            result = {}
+            for disk in c.MSFT_PhysicalDisk():
+                media = self.MEDIA_TYPE.get(int(disk.MediaType or 0), "UNKNOWN")
+                bus = self.BUS_TYPE.get(int(disk.BusType or 0), "UNKNOWN")
+                result[int(disk.DeviceId)] = (media, bus)
+            return result
+        except Exception:
+            return {}
+
+    def _guess_nand_type(self, disk_number: int) -> str:
+        """NAND 类型只能从型号名推测 —— WMI 不直接暴露这个信息。"""
+        try:
+            import wmi
+            for disk in wmi.WMI().Win32_DiskDrive():
+                if disk.Index == disk_number:
+                    model = (disk.Model or "").lower()
+                    for key, value in (("tlc", "TLC"), ("mlc", "MLC"),
+                                       ("slc", "SLC"), ("qlc", "QLC")):
+                        if key in model:
+                            return value
+                    if "v-nand" in model or "v nand" in model:
+                        return "TLC"  # 三星V-NAND通常是TLC
+                    break
+        except Exception:
+            pass
+        return "UNKNOWN"
+
     def get_disk_info_windows(self, disk_number: int) -> Tuple[str, str, str]:
         """
         在Windows系统获取磁盘信息
         返回: (disk_type, interface_type, nand_type)
+
+        先走 MSFT_PhysicalDisk（确定的枚举值），查不到再回退到型号字符串匹配。
         """
+        # --- 首选：MSFT_PhysicalDisk ---
+        physical = self._query_physical_disks()
+        if disk_number in physical:
+            media, bus = physical[disk_number]
+            if media != "UNKNOWN":
+                return media, bus, self._guess_nand_type(disk_number)
+
+        # --- 回退：型号字符串匹配（旧系统兼容）---
         try:
             import wmi
             c = wmi.WMI()
@@ -717,10 +810,11 @@ exit
             print(f"列出磁盘失败: {e}")
 
     def list_disks_windows(self):
-        """在Windows上列出磁盘"""
+        """在Windows上列出磁盘（接口与类型优先取 MSFT_PhysicalDisk 的准确值）"""
         try:
             import wmi
             c = wmi.WMI()
+            physical = self._query_physical_disks()
 
             print("可用磁盘:")
             print("-" * 80)
@@ -728,20 +822,108 @@ exit
             print("-" * 80)
 
             for disk in c.Win32_DiskDrive():
-                size_gb = int(disk.Size) / (1024 ** 3)
-                interface = disk.InterfaceType if disk.InterfaceType else "未知"
+                size_gb = int(disk.Size) / (1024 ** 3) if disk.Size else 0.0
+                model = (disk.Model or "").lower()
 
-                # 检测磁盘类型
-                model = disk.Model.lower()
-                if "ssd" in model or "solid state" in model:
-                    disk_type = "SSD"
+                # 优先用 MSFT_PhysicalDisk 的确定值
+                media, bus = physical.get(disk.Index, ("UNKNOWN", "UNKNOWN"))
+                if media != "UNKNOWN":
+                    disk_type, interface = media, bus
                 else:
-                    disk_type = "HDD"
+                    # 回退：原型号匹配逻辑
+                    interface = disk.InterfaceType if disk.InterfaceType else "未知"
+                    if "ssd" in model or "solid state" in model:
+                        disk_type = "SSD"
+                    else:
+                        disk_type = "HDD"
 
                 print(f"{disk.Index:<5} {disk.Model:<40} {size_gb:<10.1f} {interface:<10} {disk_type:<10}")
 
         except Exception as e:
             print(f"列出磁盘失败: {e}")
+
+    # ------------------------------------------------------------------
+    # 演练模式
+    # ------------------------------------------------------------------
+    def simulate_wipe(self, disk_identifier: str, fill_rate: float, pattern: int = 0) -> bool:
+        """演练模式：完整走一遍擦除流程，但不写入任何数据、不打开物理设备。
+
+        - 磁盘信息 / 填充率 / 填充大小均按真实磁盘**真实计算**（只读查询）
+        - 进度输出格式与真实擦除保持一致
+        - 没有任何落盘写入，可以安全地反复运行
+
+        用途：在没有可牺牲设备时预览流程、验证逻辑是否正常。
+        """
+        print()
+        print("!" * 62)
+        print("  演练模式 —— 不会写入任何数据，不会打开物理磁盘")
+        print("!" * 62)
+
+        try:
+            import wmi
+            target_disk = None
+            for disk in wmi.WMI().Win32_DiskDrive():
+                if disk.Index == int(disk_identifier):
+                    target_disk = disk
+                    break
+
+            if not target_disk:
+                print(f"未找到磁盘编号: {disk_identifier}")
+                return False
+
+            disk_size_bytes = int(target_disk.Size)
+            caption = target_disk.Caption
+        except Exception as e:
+            print(f"读取磁盘信息失败: {e}")
+            return False
+
+        disk_size_gb = disk_size_bytes / (1024 ** 3)
+        fill_bytes = int(disk_size_bytes * fill_rate)
+        fill_gb = fill_bytes / (1024 ** 3)
+
+        # ---- 以下输出格式与真实擦除保持一致 ----
+        print(f"开始擦除磁盘 {caption}...")
+        print(f"磁盘大小: {disk_size_gb:.2f} GB")
+        print(f"填充率: {fill_rate * 100:.1f}%")
+        print(f"实际填充: {fill_gb:.2f} GB")
+        print(f"使用模式: {'0x00' if pattern == 0 else '0xFF'}")
+
+        # 取一个盘符用于显示（有分区就用实际盘符，否则用占位符）
+        drive_letter = "D:"
+        try:
+            partitions = self.get_disk_partitions_windows(int(disk_identifier))
+            if partitions:
+                drive_letter = partitions[0]["letter"]
+        except Exception:
+            pass
+
+        print(f"通过创建大文件填充驱动器 {drive_letter}...")
+        print(f"填充大小: {fill_gb:.2f} GB")
+
+        # 按真实切片粒度计算文件数（1 GB 一片），保证数字自洽
+        max_file_size = 1024 * 1024 * 1024
+        num_files = max(1, math.ceil(fill_bytes / max_file_size))
+        first_size = min(max_file_size, fill_bytes)
+
+        print(f"创建文件 1/{num_files}: "
+              f"{os.path.join(drive_letter, 'wipe_0000.tmp')} ({first_size / (1024 ** 3):.2f} GB)")
+
+        # 模拟第一个文件的写入进度（纯计时，不落盘）
+        blocks = 1024
+        for block in range(blocks):
+            if block % 16 == 0:
+                print(f"  进度: {(block + 1) / blocks * 100:5.1f}%", end="\r")
+            time.sleep(0.004)
+        print("  进度: 100.0%")
+
+        print("删除临时文件...")
+        print(f"驱动器 {drive_letter} 文件填充完成")
+
+        print()
+        print("!" * 62)
+        print("  演练结束 —— 以上仅为界面演示，未写入任何数据")
+        print("!" * 62)
+        return True
 
 
 def show_interactive_menu():
@@ -834,7 +1016,9 @@ def interactive_mode():
                     continue
 
                 # 执行擦除
-                if platform.system() == "Linux":
+                if SIMULATE:
+                    success = wiper.simulate_wipe(disk_input, fill_rate, pattern)
+                elif platform.system() == "Linux":
                     success = wiper.wipe_disk_linux(disk_input, fill_rate, pattern)
                 else:  # Windows
                     success = wiper.wipe_disk_windows(int(disk_input), fill_rate, pattern)
@@ -913,14 +1097,20 @@ def main():
     parser.add_argument('--pattern', type=int, choices=[0, 1], default=0,
                         help='填充模式: 0=填充0, 1=填充1')
     parser.add_argument('--list', action='store_true', help='列出所有磁盘')
+    parser.add_argument('--simulate', action='store_true',
+                        help='演练模式：只读磁盘信息 + 模拟进度，不写入任何数据')
     parser.add_argument('--interactive', '-i', action='store_true', help='进入交互式模式')
 
     args = parser.parse_args()
 
+    global SIMULATE
+    if args.simulate:
+        SIMULATE = True
+
     wiper = DiskWiper()
 
-    # 检查权限，如果需要则请求提权
-    if not wiper.request_admin_privileges():
+    # 检查权限，如果需要则请求提权（演练模式不写盘，无需管理员）
+    if not SIMULATE and not wiper.request_admin_privileges():
         sys.exit(1)
 
     # 如果指定了--interactive参数或没有任何参数，进入交互式模式
@@ -970,7 +1160,9 @@ def main():
         return
 
     # 执行擦除
-    if platform.system() == "Linux":
+    if SIMULATE:
+        success = wiper.simulate_wipe(args.disk, fill_rate, args.pattern)
+    elif platform.system() == "Linux":
         success = wiper.wipe_disk_linux(args.disk, fill_rate, args.pattern)
     elif platform.system() == "Windows":
         success = wiper.wipe_disk_windows(int(args.disk), fill_rate, args.pattern)

@@ -1,0 +1,13 @@
+# Python 虚拟环境（体积大，绝不入库）
+.venv/
+venv/
+env/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 本地备份 / 临时文件
+*.bak
+*.bak-*
